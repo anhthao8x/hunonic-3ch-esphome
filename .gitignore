@@ -1,0 +1,11 @@
+# Thông tin nhạy cảm — KHÔNG BAO GIỜ commit
+secrets.yaml
+
+# Thư mục build của ESPHome
+.esphome/
+
+# File biên dịch / tạm
+*.bin
+*.elf
+*.map
+.DS_Store

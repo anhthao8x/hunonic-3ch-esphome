@@ -1,0 +1,481 @@
+substitutions:
+  # Định nghĩa tên thiết bị tại đây
+  devicename: hunonic-3ch-interlock
+esphome:
+  name: $devicename
+  name_add_mac_suffix: true # Node name sẽ là hunonic-3ch-interlock-abcd
+  platformio_options:
+    board_build.f_cpu: 160000000L
+    board_upload.maximum_ram_size: 131072 #128kB
+  project: 
+    name: "AnhThao.Hunonic_3CH" 
+    version: "ESP07S"
+    
+  # ---LED Status nháy 3 lần khi boot---
+  on_boot:
+    priority: -100
+    then:
+      # Đọc trực tiếp từ select (có restore_value riêng đáng tin cậy)
+      - if:
+          condition:
+            lambda: 'return id(power_on_sel).state == "On";'
+          then:
+            - switch.turn_on: switch_led_1
+            - switch.turn_on: switch_led_2
+            - switch.turn_on: switch_led_3
+      - if:
+          condition:
+            lambda: 'return id(power_on_sel).state == "Off";'
+          then:
+            - switch.turn_off: switch_led_1
+            - switch.turn_off: switch_led_2
+            - switch.turn_off: switch_led_3
+      - if:
+          condition:
+            lambda: 'return id(power_on_sel).state == "Last_State";'
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(s1_state);'
+                then:
+                  - switch.turn_on: switch_led_1
+                else:
+                  - switch.turn_off: switch_led_1
+            - if:
+                condition:
+                  lambda: 'return id(s2_state);'
+                then:
+                  - switch.turn_on: switch_led_2
+                else:
+                  - switch.turn_off: switch_led_2
+            - if:
+                condition:
+                  lambda: 'return id(s3_state);'
+                then:
+                  - switch.turn_on: switch_led_3
+                else:
+                  - switch.turn_off: switch_led_3
+            
+      # Delay 500ms chờ chip ADS TS04 khởi động ổn định trước khi cho phép toggle
+      - delay: 500ms
+      - repeat:
+          count: 3
+          then:
+            - light.turn_on: status_led
+            - delay: 300ms
+            - light.turn_off: status_led
+            - delay: 300ms           
+      - light.turn_off: status_led
+      # Đánh dấu boot hoàn tất - từ đây nút cảm ứng mới được phép toggle switch
+      - globals.set:
+          id: boot_done
+          value: 'true'
+
+esp8266:
+  board: esp07s # ESP-12F tương thích với esp12e
+  early_pin_init: false # Tránh relay/LED bị glitch khi boot
+  restore_from_flash: true # Lưu preferences vào Flash thay vì RTC Memory → nhớ sau khi rút điện
+  
+preferences:
+  flash_write_interval: 60s # Ghi flash sau 60s, tránh hao mòn flash
+  
+logger:
+  level: INFO
+
+globals:
+  # Lưu trạng thái ON/OFF của từng switch cho chế độ Last_State
+  - id: s1_state
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: s2_state
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: s3_state
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  # Flag: chỉ lưu state sau khi boot xong, tránh bị ghi đè khi init
+  - id: boot_done
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+api:
+  reboot_timeout: 10min
+  encryption:
+    key: !secret api_encryption_key
+
+# Enable OTA firmware updates (via ESPHome)
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+# Cấu hình Wi-Fi
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  fast_connect: true
+
+# Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "${devicename}"
+    password: !secret ap_password
+captive_portal:
+
+# Cấu hình 3 đèn LED là Output
+output:
+  # LED1 (GPIO14/D5)
+  - platform: gpio
+    pin: GPIO14
+    id: led_1_output
+
+  # LED2 (GPIO12/D6)
+  - platform: gpio
+    pin: GPIO12
+    id: led_2_output
+
+  # LED3 (GPIO13/D7)
+  - platform: gpio
+    pin: GPIO13
+    id: led_3_output
+
+  # Output cho LED Status
+  - platform: gpio
+    pin: GPIO16
+    inverted: true
+    id: led_stt_output
+
+# Cấu hình 3 nút bấm là Binary Sensor (Input)
+# Chip cảm ứng ADS TS04 - output open-drain, active LOW khi chạm
+# Lưu ý: Debounce 50ms và thêm delayed_on để tránh false trigger khi boot
+binary_sensor:
+  # BTN1 (GPIO5) - TS04 OUT1
+  - platform: gpio
+    pin:
+      number: GPIO5
+      mode:
+        input: true
+        pullup: true    # Giữ pullup vì TS04 dùng open-drain output
+      inverted: true    # LOW = chạm
+    name: "Button 1"
+    id: btn1
+    internal: true
+    filters:
+      # delayed_on: chip TS04 cần ổn định, không trigger ngay khi boot
+      - delayed_on: 50ms    # Phải giữ chạm 50ms mới kích hoạt → tránh false trigger
+      - delayed_off: 50ms   # Phải nhả 50ms mới reset → tránh bounce
+    on_click:
+      min_length: 50ms
+      max_length: 700ms
+      then:
+        - if:
+            condition:
+              lambda: 'return id(boot_done);'
+            then:
+              - switch.toggle: switch_led_1
+    on_multi_click:
+      # === Nhấn giữ ≥800ms → binary sensor ON ===
+      - timing:
+          - ON for at least 800ms
+        then:
+          - if:
+              condition:
+                lambda: 'return id(boot_done);'
+              then:
+                - binary_sensor.template.publish:
+                    id: btn1_scene_bs
+                    state: true
+                # Status LED nháy xác nhận
+                - light.turn_on: status_led
+                - delay: 150ms
+                - light.turn_off: status_led
+    on_release:
+      then:
+        - binary_sensor.template.publish:
+            id: btn1_scene_bs
+            state: false
+
+  # BTN2 (GPIO4) - TS04 OUT2
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Button 2"
+    id: btn2
+    internal: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_click:
+      min_length: 50ms
+      max_length: 700ms
+      then:
+        - if:
+            condition:
+              lambda: 'return id(boot_done);'
+            then:
+              - switch.toggle: switch_led_2
+    on_multi_click:
+      # === Nhấn giữ ≥800ms → binary sensor ON ===
+      - timing:
+          - ON for at least 800ms
+        then:
+          - if:
+              condition:
+                lambda: 'return id(boot_done);'
+              then:
+                - binary_sensor.template.publish:
+                    id: btn2_scene_bs
+                    state: true
+                # Status LED nháy xác nhận (LED nút và relay dùng chung GPIO)
+                - light.turn_on: status_led
+                - delay: 150ms
+                - light.turn_off: status_led
+    on_release:
+      then:
+        - binary_sensor.template.publish:
+            id: btn2_scene_bs
+            state: false
+
+  # BTN3 (GPIO0) - TS04 OUT3
+  # QUAN TRỌNG: GPIO0 là strapping pin - nếu LOW khi boot → ESP vào Flash Mode
+  # Đã thêm delayed_on 50ms để tránh trường hợp TS04 xuất LOW lúc khởi động
+  - platform: gpio
+    pin:
+      number: GPIO0
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Button 3"
+    id: btn3
+    internal: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_click:
+      min_length: 50ms
+      max_length: 700ms
+      then:
+        - if:
+            condition:
+              lambda: 'return id(boot_done);'
+            then:
+              - switch.toggle: switch_led_3
+    on_multi_click:
+      # === Nhấn giữ ≥800ms → binary sensor ON ===
+      - timing:
+          - ON for at least 800ms
+        then:
+          - if:
+              condition:
+                lambda: 'return id(boot_done);'
+              then:
+                - binary_sensor.template.publish:
+                    id: btn3_scene_bs
+                    state: true
+                # Status LED nháy xác nhận (LED nút và relay dùng chung GPIO)
+                - light.turn_on: status_led
+                - delay: 150ms
+                - light.turn_off: status_led
+    on_release:
+      then:
+        - binary_sensor.template.publish:
+            id: btn3_scene_bs
+            state: false
+
+  # === Binary Sensor: ON khi đang giữ nút ≥800ms, OFF khi nhả ===
+  - platform: template
+    name: "Button 1 Hold"
+    id: btn1_scene_bs
+    icon: mdi:gesture-tap-hold
+
+  - platform: template
+    name: "Button 2 Hold"
+    id: btn2_scene_bs
+    icon: mdi:gesture-tap-hold
+
+  - platform: template
+    name: "Button 3 Hold"
+    id: btn3_scene_bs
+    icon: mdi:gesture-tap-hold
+
+  # Check trạng thái online
+  - platform: status
+    name: "Online"
+    id: Huno_connected
+
+# Cấu hình 3 công tắc để điều khiển LED + Chế độ Interlock
+switch:
+  - platform: template
+    name: "Interlock"
+    id: interlock_mode_switch
+    entity_category: "config"
+    restore_mode: RESTORE_DEFAULT_OFF # Mặc định TẮT chế độ Interlock
+    icon: mdi:lock-check
+    optimistic: true # Cần thiết cho Template Switch không có action cụ thể
+  
+  # Công tắc cho LED1/Relay 1 (Đã thêm Logic Khóa Liên Động Tùy Chọn)
+  - platform: output
+    name: "Switch 1"
+    id: switch_led_1
+    output: led_1_output
+    restore_mode: ALWAYS_OFF # Không dùng restore mặc định nữa
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_done);'
+          then:
+            - globals.set:
+                id: s1_state
+                value: 'true'
+      - if:
+          condition:
+            switch.is_on: interlock_mode_switch
+          then:
+            - switch.turn_off: switch_led_2
+            - switch.turn_off: switch_led_3
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_done);'
+          then:
+            - globals.set:
+                id: s1_state
+                value: 'false'
+
+  # Công tắc cho LED2/Relay 2
+  - platform: output
+    name: "Switch 2"
+    id: switch_led_2
+    output: led_2_output
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_done);'
+          then:
+            - globals.set:
+                id: s2_state
+                value: 'true'
+      - if:
+          condition:
+            switch.is_on: interlock_mode_switch
+          then:
+            - switch.turn_off: switch_led_1
+            - switch.turn_off: switch_led_3
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_done);'
+          then:
+            - globals.set:
+                id: s2_state
+                value: 'false'
+
+  # Công tắc cho LED3/Relay 3
+  - platform: output
+    name: "Switch 3"
+    id: switch_led_3
+    output: led_3_output
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_done);'
+          then:
+            - globals.set:
+                id: s3_state
+                value: 'true'
+      - if:
+          condition:
+            switch.is_on: interlock_mode_switch
+          then:
+            - switch.turn_off: switch_led_1
+            - switch.turn_off: switch_led_2
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_done);'
+          then:
+            - globals.set:
+                id: s3_state
+                value: 'false'
+            
+  # Công tắc tổng (giữ nguyên)
+  - platform: template
+    id: relay_all
+    name: "Switch All"
+    turn_on_action:
+      - switch.turn_on: switch_led_1
+      - switch.turn_on: switch_led_2
+      - switch.turn_on: switch_led_3
+    turn_off_action:
+      - switch.turn_off: switch_led_1
+      - switch.turn_off: switch_led_2
+      - switch.turn_off: switch_led_3
+    optimistic: true
+    icon: mdi:light-switch
+
+
+select:
+  - platform: template
+    name: "Power On Behavior"
+    id: power_on_sel
+    entity_category: "config"
+    icon: mdi:power-settings
+    optimistic: true
+    restore_value: true
+    initial_option: "Off"
+    options:
+      - "On"
+      - "Off"
+      - "Last_State"
+    on_value: [] # Không cần action thêm, select tự lưu restore_value
+    
+button:
+  - platform: safe_mode
+    name: "Safe Mode"  
+    id: safe_mode_button
+    icon: mdi:security
+    disabled_by_default: true
+
+  - platform: factory_reset
+    name: "Factory Default"
+    id: factory_button
+    icon: mdi:heart-broken
+    disabled_by_default: true
+
+  - platform: restart
+    name: "Button Restart"
+    id: restart_button
+
+# Cấu hình LED status (LEDstt - GPIO16/D0)
+light:
+  - platform: binary
+    output: led_stt_output
+    name: "Status LED"
+    id: status_led
+    entity_category: "config"
+    
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP"
+      icon: mdi:ip-network
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    update_interval: 60s
+
+# Ghi chú: Button 1/2/3 Hold là binary sensor - ON khi giữ ≥800ms, OFF khi nhả tay
